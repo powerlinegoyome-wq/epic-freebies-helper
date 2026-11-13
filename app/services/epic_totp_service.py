@@ -320,70 +320,170 @@ async def submit_totp_challenge(
         )
         return False
 
-    selectors = TOTP_INPUT_SELECTORS
-    if await _page_has_mfa_signal(page):
-        selectors += GENERIC_TEXT_INPUT_SELECTORS
+    # Focus the first input box
+    focused = await _focus_totp_entry(page)
+    await page.wait_for_timeout(200)
 
-    filled = False
-    for selector in selectors:
-        locator = page.locator(selector)
-        try:
-            indexes = await _visible_indexes(page, selector, limit=max(len(code), 1))
-            if not indexes:
-                continue
+    # Primary entry: Type digits with real keyboard events so React controlled inputs auto-advance
+    await page.keyboard.type(code, delay=120)
+    await page.wait_for_timeout(400)
 
-            if len(indexes) >= len(code):
-                fields = [locator.nth(index) for index in indexes[: len(code)]]
-                if not all([await _mask_totp_input(field) for field in fields]):
-                    continue
-                for field, digit in zip(fields, code):
-                    await field.fill(digit, timeout=1000)
-            else:
-                field = locator.nth(indexes[0])
-                await expect(field).to_be_visible(timeout=2000)
-                if not await _mask_totp_input(field):
-                    continue
-                await field.fill(code, timeout=2000)
-            filled = True
-            break
-        except Exception:
-            continue
+    # Check how many digits were entered across the 6 boxes
+    filled_values = await page.evaluate(
+        """
+        () => {
+          const isVisible = (el) => {
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+          };
+          const inputs = Array.from(document.querySelectorAll("input, [contenteditable='true'], [role='textbox']")).filter(isVisible);
+          const narrow = inputs.filter((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width >= 20 && r.width <= 120 && r.height >= 20 && r.height <= 120;
+          });
+          return narrow.map((el) => el.value || el.textContent || '');
+        }
+        """
+    )
+    entered = "".join(filled_values)
+    logger.debug("TOTP input check: entered='{}', expected_len={}", entered, len(code))
 
-    if not filled and await _page_has_mfa_signal(page):
-        if await _focus_totp_entry(page):
-            await page.keyboard.type(code, delay=80)
-            filled = True
-        else:
-            logger.error("Could not focus a masked Epic authenticator 2FA code input")
+    # If keyboard typing did not fill all boxes, fill individually using React prototype value setter
+    if entered != code:
+        logger.warning(
+            "Keyboard typing entered {!r} (expected length {}); applying React-compatible synthetic input dispatch",
+            entered,
+            len(code),
+        )
+        await page.evaluate(
+            """
+            (code) => {
+              const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const inputs = Array.from(document.querySelectorAll("input, [contenteditable='true'], [role='textbox']")).filter(isVisible);
+              const narrow = inputs.filter((el) => {
+                const r = el.getBoundingClientRect();
+                return r.width >= 20 && r.width <= 120 && r.height >= 20 && r.height <= 120;
+              });
 
-    if not filled:
-        logger.error("Could not find Epic authenticator 2FA code input")
-        return False
+              const proto = window.HTMLInputElement.prototype;
+              const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+
+              if (narrow.length >= code.length) {
+                for (let i = 0; i < code.length; i++) {
+                  const el = narrow[i];
+                  if (nativeSetter) {
+                    nativeSetter.call(el, code[i]);
+                  } else {
+                    el.value = code[i];
+                  }
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+              } else {
+                const single = inputs.find((el) => {
+                  const m = [el.name, el.id, el.getAttribute('autocomplete'), el.getAttribute('inputmode')].join(' ').toLowerCase();
+                  return m.includes('code') || m.includes('numeric') || m.includes('one-time');
+                }) || inputs[0];
+                if (single) {
+                  if (nativeSetter) {
+                    nativeSetter.call(single, code);
+                  } else {
+                    single.value = code;
+                  }
+                  single.dispatchEvent(new Event('input', { bubbles: true }));
+                  single.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+              }
+            }
+            """,
+            code,
+        )
+        await page.wait_for_timeout(300)
+
+    # Mask the inputs for visual security (screenshots)
+    with suppress(Exception):
+        await page.evaluate(
+            """
+            () => {
+              const inputs = document.querySelectorAll("input, [contenteditable='true'], [role='textbox']");
+              for (const el of inputs) {
+                el.style.setProperty('-webkit-text-security', 'disc', 'important');
+                el.style.setProperty('color', 'transparent', 'important');
+                el.style.setProperty('caret-color', 'transparent', 'important');
+              }
+            }
+            """
+        )
 
     if before_submit:
         before_submit()
 
-    clicked = False
+    # Locate submit/continue button
+    submit_button = None
     for selector in (
         "#continue",
-        "#sign-in",
         "button[type='submit']",
+        "button:has-text('Continue')",
+        "button:has-text('Devam')",
         "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
         "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'verify')]",
+        "#sign-in",
     ):
         with suppress(Exception):
-            button = page.locator(selector).first
-            if await button.is_visible(timeout=1000):
-                await button.click(timeout=2000)
-                clicked = True
+            locator = page.locator(selector).first
+            if await locator.is_visible(timeout=1000):
+                submit_button = locator
                 break
 
-    if not clicked:
-        with suppress(Exception):
-            await page.keyboard.press("Enter")
-            clicked = True
+    clicked = False
+    if submit_button is not None:
+        # Wait up to 6 seconds for React to validate the 6 digits and enable the button
+        for _ in range(12):
+            if await submit_button.is_enabled():
+                break
+            await page.wait_for_timeout(500)
+
+        if await submit_button.is_enabled():
+            with suppress(Exception):
+                await submit_button.click(timeout=3000)
+                clicked = True
+                logger.success("Clicked enabled Epic authenticator 2FA submit button")
+        else:
+            logger.warning("Continue button still disabled after waiting; attempting forced submission via JS and Enter")
+            with suppress(Exception):
+                js_ok = await page.evaluate(
+                    """
+                    () => {
+                      const btn = document.querySelector("#continue, button[type='submit']") ||
+                        Array.from(document.querySelectorAll("button")).find(b => {
+                          const t = (b.innerText || b.textContent || '').toLowerCase();
+                          return t.includes('continue') || t.includes('verify');
+                        });
+                      if (btn) {
+                        btn.removeAttribute('disabled');
+                        btn.disabled = false;
+                        btn.click();
+                        return true;
+                      }
+                      return false;
+                    }
+                    """
+                )
+                if js_ok:
+                    clicked = True
+
+    # Also press Enter as standard form submission fallback
+    with suppress(Exception):
+        await page.keyboard.press("Enter")
+        clicked = True
 
     if clicked:
         logger.success("Submitted Epic authenticator 2FA code")
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2000)
+
     return clicked

@@ -712,6 +712,15 @@ def apply_hcaptcha_drag_patch() -> None:
                 )
                 logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
 
+                if challenge_bbox is not None and getattr(response, "points", None):
+                    min_x = float(challenge_bbox["x"]) + 15
+                    max_x = float(challenge_bbox["x"]) + float(challenge_bbox["width"]) - 15
+                    min_y = float(challenge_bbox["y"]) + 15
+                    max_y = float(challenge_bbox["y"]) + float(challenge_bbox["height"]) - 15
+                    for point in response.points:
+                        point.x = min(max(float(point.x), min_x), max_x)
+                        point.y = min(max(float(point.y), min_y), max_y)
+
                 validation_error = _point_answer_validation_error(
                     response.points,
                     challenge_bbox=challenge_bbox,

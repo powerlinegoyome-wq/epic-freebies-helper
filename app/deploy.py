@@ -64,6 +64,54 @@ def _is_free_game_rate_limit_error(err: Exception) -> bool:
     return False
 
 
+async def _inject_epic_cookies(browser) -> int:
+    cookies_data = os.getenv("EPIC_COOKIES", "").strip()
+    if not cookies_data:
+        return 0
+
+    playwright_cookies = []
+    for line in cookies_data.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            domain, flag, path, secure, expiration, name, value = parts[:7]
+            c = {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": path,
+                "secure": secure.upper() == "TRUE",
+            }
+            try:
+                exp = int(float(expiration))
+                if exp > 0:
+                    c["expires"] = exp
+            except ValueError:
+                pass
+            playwright_cookies.append(c)
+
+    injected = 0
+    for c in playwright_cookies:
+        try:
+            await browser.add_cookies([c])
+            injected += 1
+        except Exception:
+            if c.get("domain", "").startswith("."):
+                c_copy = dict(c)
+                c_copy["domain"] = c["domain"].lstrip(".")
+                try:
+                    await browser.add_cookies([c_copy])
+                    injected += 1
+                except Exception:
+                    pass
+
+    if injected > 0:
+        logger.success(f"Injected {injected} Epic Games session cookies into browser context")
+    return injected
+
+
 @logger.catch(reraise=True)
 async def execute_browser_tasks(headless: bool | str = True, *, collect_summary: bool = False):
     """
@@ -82,6 +130,9 @@ async def execute_browser_tasks(headless: bool | str = True, *, collect_summary:
         # Initialize or reuse existing browser page
         page = browser.pages[0] if browser.pages else await browser.new_page()
         logger.debug("Browser initialized successfully")
+
+        # Inject pre-authenticated session cookies if available
+        await _inject_epic_cookies(browser)
 
         # Handle Epic Games authentication
         logger.debug("Initiating Epic Games authentication")

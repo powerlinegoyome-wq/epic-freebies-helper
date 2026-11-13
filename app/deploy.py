@@ -12,6 +12,7 @@ using browser automation and scheduling capabilities.
 
 import asyncio
 import json
+import os
 import signal
 from contextlib import suppress
 from datetime import datetime

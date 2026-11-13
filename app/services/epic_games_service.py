@@ -775,12 +775,73 @@ class EpicGames:
             )
 
     @staticmethod
+    async def _wait_for_page_or_cloudflare(page: Page, title: str, timeout_ms: int = 35000) -> bool:
+        """Wait for Cloudflare Turnstile / Managed Challenge to complete and redirect to the actual game page."""
+        start_time = time.monotonic()
+        cf_markers = [
+            "one more step",
+            "please complete a security check to continue",
+            "waiting for store.epicgames.com to respond",
+            "challenge-platform",
+            "just a moment...",
+            "checking your browser",
+        ]
+
+        while (time.monotonic() - start_time) * 1000 < timeout_ms:
+            # 1. Age gate check
+            with suppress(Exception):
+                continue_btn = page.locator(
+                    "//button[contains(., 'Continue') or .//span[contains(text(), 'Continue')] or contains(., 'Devam')]"
+                ).first
+                if await continue_btn.is_visible():
+                    logger.info("Dismissing age gate continue button...")
+                    await continue_btn.click()
+                    await page.wait_for_timeout(1000)
+
+            # 2. Check if purchase CTA button is visible
+            purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
+            with suppress(Exception):
+                if await purchase_btn.is_visible():
+                    logger.debug(f"Product page loaded: purchase button visible for {title}")
+                    return True
+
+            # 3. Check page body text
+            body_text = ""
+            with suppress(Exception):
+                body_text = (await page.locator("body").text_content(timeout=1000) or "")
+
+            body_upper = body_text.upper()
+            if any(m in body_upper for m in ["IN LIBRARY", "OWNED", "ALREADY OWNED", "IN YOUR LIBRARY"]):
+                logger.debug(f"Product page loaded: detected store marker for {title}")
+                return True
+
+            # 4. Check if Cloudflare Turnstile is actively challenging
+            if any(marker in body_text.lower() for marker in cf_markers):
+                logger.info(f"Cloudflare Turnstile challenge active on {title}; waiting for auto-resolution...")
+                # Attempt to click Turnstile checkbox if visible in iframe
+                with suppress(Exception):
+                    cf_frame = page.frame_locator(
+                        "iframe[src*='challenges.cloudflare.com'], iframe[src*='challenge-platform']"
+                    ).first
+                    checkbox = cf_frame.locator("input[type='checkbox'], #challenge-stage input, .ctp-checkbox-label").first
+                    if await checkbox.is_visible():
+                        logger.info("Found Turnstile checkbox; clicking...")
+                        await checkbox.click()
+                await page.wait_for_timeout(2000)
+                continue
+
+            await page.wait_for_timeout(1000)
+
+        return True
+
+    @staticmethod
     async def _goto_product_page(page: Page, url: str, title: str, attempts: int = 3) -> bool:
         for attempt in range(1, attempts + 1):
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 with suppress(Exception):
                     await page.wait_for_load_state("networkidle", timeout=8000)
+                await EpicGames._wait_for_page_or_cloudflare(page, title, timeout_ms=35000)
                 return True
             except TimeoutError as err:
                 logger.warning(
@@ -1544,6 +1605,7 @@ class EpicGames:
             if revisit_product_page:
                 try:
                     await page.goto(url, wait_until="load", timeout=15000)
+                    await self._wait_for_page_or_cloudflare(page, promotion.title, timeout_ms=25000)
                     await page.wait_for_timeout(1500 * attempt)
                 except Exception as revisit_err:
                     logger.warning(
@@ -1957,9 +2019,40 @@ class EpicGames:
             # Epic 按钮通常有 'purchase-cta-button' 这个 TestID
             purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
 
+            # 等待按钮渲染或确认已在库中（最多等待 30 秒）
+            btn_visible = False
+            for poll in range(30):
+                # Age gate check
+                with suppress(Exception):
+                    continue_btn = page.locator(
+                        "//button[contains(., 'Continue') or .//span[contains(text(), 'Continue')] or contains(., 'Devam')]"
+                    ).first
+                    if await continue_btn.is_visible():
+                        await continue_btn.click()
+                        await page.wait_for_timeout(1000)
+
+                with suppress(Exception):
+                    if await purchase_btn.is_visible():
+                        btn_visible = True
+                        break
+
+                all_text = ""
+                with suppress(Exception):
+                    all_text = (await page.locator("body").text_content(timeout=1000) or "").upper()
+
+                if any(marker in all_text for marker in owned_markers):
+                    break
+
+                if any(marker in all_text for marker in ["ONE MORE STEP", "SECURITY CHECK", "WAITING FOR STORE.EPICGAMES.COM"]):
+                    logger.info(f"Waiting for Cloudflare security check to complete... ({poll}s)")
+                    await page.wait_for_timeout(2000)
+                    continue
+
+                await page.wait_for_timeout(1000)
+
             # 2. 如果没找到主按钮，尝试找“库中”状态
             try:
-                if not await purchase_btn.is_visible():
+                if not btn_visible:
                     # 再次检查是否在库中 (有时按钮不叫 purchase-cta，而是简单的 disabled button)
                     all_text = (await page.locator("body").text_content() or "").upper()
                     if any(marker in all_text for marker in owned_markers):

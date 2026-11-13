@@ -292,7 +292,7 @@ async def _wait_for_totp_input(page: Page, timeout_ms: int = 20000) -> bool:
         ):
             return True
 
-        if await _page_has_mfa_signal(page):
+        if await _page_has_mfa_signal(page) and await _focus_totp_entry(page):
             return True
 
         await page.wait_for_timeout(500)
